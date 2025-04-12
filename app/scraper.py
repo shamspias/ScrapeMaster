@@ -226,20 +226,27 @@ class WebScraper:
     def extract_images(self, html: str, base_url: str) -> list:
         """
         Extract image URLs from the HTML by parsing <img> tags and converting relative URLs to absolute.
-        Only images ending with allowed extensions (.png, .jpg, .jpeg) are included.
+        Filters out disallowed extensions (.svg) and URLs containing words like 'logo' or 'icon'.
+        Returns up to the last 5 valid image URLs.
         """
+        if not html:
+            return []
+
         soup = BeautifulSoup(html, 'html.parser')
         images = []
         disallowed_ext = '.svg'
+        disallowed_keywords = ['logo', 'icon']
+
         for img in soup.find_all('img'):
             src = img.get('src')
             if src:
-                # Convert relative URLs to absolute URLs using the base_url
                 full_url = urljoin(base_url, src)
-                # Check if the URL ends with one of the allowed extensions (case-insensitive)
-                if not full_url.lower().endswith(disallowed_ext):
+                lower_url = full_url.lower()
+                if not lower_url.endswith(disallowed_ext) and not any(
+                        keyword in lower_url for keyword in disallowed_keywords):
                     images.append(full_url)
-        return images
+
+        return images[-5:]  # Return last 5 (or fewer) valid image URLs
 
     async def scrape_details(self, url: str) -> dict:
         """
