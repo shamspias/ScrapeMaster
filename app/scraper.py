@@ -1,26 +1,27 @@
 """
-This module contains the WebScraper class, which implements a tiered approach
-for scraping web pages. It first attempts to retrieve rendered HTML via a Splash service
-(with JavaScript enabled). If that fails, it falls back to Selenium (Chrome in headless mode)
-and, finally, to a simple requests-based scraper. Caching is used to limit repeat requests.
+This module contains the WebScraper class which implements a high-performance scraping strategy
+by racing multiple methods concurrently:
+  1. Splash (JS-enabled) using aiohttp.
+  2. Selenium (Chrome in headless mode) using asyncio.to_thread.
+  3. A fallback aiohttp-based request.
 
-An option is provided to include image extraction, which is disabled by default.
-If enabled, the scraper extracts image URLs from the page.
+A semaphore is used to limit concurrency when processing internal links.
+Caching is employed to avoid redundant requests.
 
-Ensure you have:
-  - A running Splash service (e.g., via Docker: docker run -p 8050:8050 scrapinghub/splash)
+Requirements:
+  - A running Splash service (e.g., via docker run -p 8050:8050 scrapinghub/splash)
   - Google Chrome (or Chromium) and ChromeDriver installed for Selenium
-  - The required Python packages, as specified in requirements.txt
+  - Python packages: aiohttp, selenium, beautifulsoup4, etc.
 """
 
 import random
 import re
 import time
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin
 from difflib import SequenceMatcher
 
+import aiohttp
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -29,6 +30,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from app.cache_manager import Cache
+
+# Limit concurrent internal link scrapes (tweak as needed)
+SEM_MAX_CONCURRENT = 10
 
 
 def compute_similarity(text1: str, text2: str) -> float:
@@ -41,16 +45,15 @@ def compute_similarity(text1: str, text2: str) -> float:
 
 class WebScraper:
     """
-    WebScraper implements a multi-tiered strategy for scraping websites:
-      1. Splash (JS enabled) - ideal for dynamic pages.
-      2. Selenium (Chrome in headless mode) - fallback if Splash fails.
-      3. Requests - final fallback if all else fails.
+    WebScraper implements a three-tiered strategy for fast scraping by concurrently launching:
+      1. Splash (JS-enabled) via aiohttp.
+      2. Selenium (headless Chrome).
+      3. A fallback aiohttp request.
 
-    It extracts page details such as title, text snippet, full text, and computes a similarity score
-    against an optional query. Additionally, image extraction can be enabled via the include_images flag.
+    Whichever method returns nonempty HTML first is used. In addition, internal link scraping is done
+    concurrently (limited by a semaphore) and image extraction is optional.
     """
 
-    # Predefined user agents for rotation.
     USER_AGENTS = [
         'Mozilla/5.0 (X11; CrOS x86_64 13729.56.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -59,19 +62,18 @@ class WebScraper:
 
     def __init__(self, query: str = "", include_images: bool = False) -> None:
         """
-        Initialize the scraper with an optional query for similarity scoring and an image extraction flag.
-        :param query: Optional string to compare against page content.
-        :param include_images: If True, image URLs will be extracted.
+        Initialize the scraper with an optional query (for similarity scoring)
+        and a flag to control image extraction.
         """
-        self.executor = ThreadPoolExecutor(max_workers=10)
-        self.cache = Cache(expiry=60)  # Cache expiry set to 60 seconds
+        self.cache = Cache(expiry=60)
         self.query = query
         self.include_images = include_images
+        # Semaphore to limit concurrent processing of internal links.
+        self.semaphore = asyncio.Semaphore(SEM_MAX_CONCURRENT)
 
     def create_driver(self):
         """
-        Create and return a Selenium Chrome WebDriver instance in headless mode
-        with a randomly selected user agent.
+        Create and return a Selenium Chrome WebDriver instance (headless) with a random user agent.
         """
         options = Options()
         options.add_argument('--headless')
@@ -85,102 +87,106 @@ class WebScraper:
 
     def change_user_agent(self, options):
         """
-        Randomly select and apply one of the predefined user agents.
+        Randomly choose and apply a user agent to the Selenium options.
         """
         try:
-            random_user_agent = random.choice(self.USER_AGENTS)
-            print(f"Using user agent: {random_user_agent}")
-            options.add_argument('user-agent={}'.format(random_user_agent))
+            ua = random.choice(self.USER_AGENTS)
+            print(f"Using user agent: {ua}")
+            options.add_argument(f'user-agent={ua}')
         except Exception as e:
-            print(f"Error in selecting user agent: {e}")
+            print(f"Error setting user agent: {e}")
 
     async def get_html_using_splash(self, url: str) -> str:
         """
-        Attempt to retrieve the HTML of a URL using a Splash service.
-        This is executed in a thread to avoid blocking the event loop.
+        Asynchronously retrieve rendered HTML from a Splash service using aiohttp.
         """
-        return await asyncio.to_thread(self._get_html_using_splash, url)
-
-    def _get_html_using_splash(self, url: str) -> str:
-        """
-        Synchronously request the rendered HTML from Splash.
-        Returns an empty string on failure.
-        """
-        import requests
         splash_url = "http://localhost:8050/render.html"
         params = {"url": url, "wait": 2, "timeout": 10}
         try:
-            response = requests.get(splash_url, params=params, timeout=15)
-            if response.status_code == 200:
-                return response.text
+            async with aiohttp.ClientSession() as session:
+                async with session.get(splash_url, params=params, timeout=15) as response:
+                    if response.status == 200:
+                        return await response.text()
         except Exception as e:
-            print(f"Splash error for URL {url}: {e}")
+            print(f"Splash error for {url}: {e}")
         return ""
 
-    async def get_html(self, url: str) -> str:
+    async def get_html_using_selenium(self, url: str) -> str:
         """
-        Asynchronously retrieve the HTML content of a page.
-          1. Try Splash (JS enabled).
-          2. If Splash fails, attempt Selenium.
-          3. If Selenium fails, use a fallback requests-based scraper.
+        Asynchronously retrieve HTML using Selenium.
+        This wraps the synchronous _get_html_using_selenium function.
         """
-        # First, attempt with Splash.
-        html = await self.get_html_using_splash(url)
-        if html:
-            return html
+        return await asyncio.to_thread(self._get_html_using_selenium, url)
 
-        # Next, try Selenium.
+    def _get_html_using_selenium(self, url: str) -> str:
+        """
+        Synchronously retrieve HTML using Selenium.
+        """
         driver = None
         try:
             driver = self.create_driver()
+            driver.get(url)
+            WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.TAG_NAME, "body"))
+            )
+            html = driver.page_source
+            driver.quit()
+            return html
         except Exception as e:
-            print(f"Error initializing Selenium: {e}")
-            driver = None
-
-        if driver is not None:
-            try:
-                driver.get(url)
-                WebDriverWait(driver, 10).until(
-                    EC.presence_of_element_located((By.TAG_NAME, "body"))
-                )
-                html = driver.page_source
-                driver.quit()
-                if html:
-                    return html
-            except Exception as e:
-                print(f"Selenium error for URL {url}: {e}")
+            print(f"Selenium error for {url}: {e}")
+            if driver:
                 try:
                     driver.quit()
                 except Exception:
                     pass
-
-        # Finally, use the fallback method (requests).
-        return await self.fallback_get_html(url)
+        return ""
 
     async def fallback_get_html(self, url: str) -> str:
         """
-        Asynchronously retrieve HTML using the requests library as a final fallback.
+        Asynchronously retrieve HTML using aiohttp as the final fallback.
         """
-        return await asyncio.to_thread(self._fallback_get_html, url)
-
-    def _fallback_get_html(self, url: str) -> str:
-        """
-        Synchronously retrieve HTML using requests.
-        """
-        import requests
         try:
-            headers = {"User-Agent": random.choice(self.USER_AGENTS)}
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                return response.text
+            async with aiohttp.ClientSession() as session:
+                headers = {"User-Agent": random.choice(self.USER_AGENTS)}
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        return await response.text()
         except Exception as e:
-            print(f"Fallback requests error for {url}: {e}")
+            print(f"Fallback error for {url}: {e}")
         return ""
+
+    async def get_html(self, url: str) -> str:
+        """
+        Concurrently launch the three scraping methods (Splash, Selenium, fallback) and return the
+        first nonempty result. Any pending tasks are canceled.
+        """
+        tasks = {
+            "splash": asyncio.create_task(self.get_html_using_splash(url)),
+            "selenium": asyncio.create_task(self.get_html_using_selenium(url)),
+            "fallback": asyncio.create_task(self.fallback_get_html(url))
+        }
+        done, pending = await asyncio.wait(
+            tasks.values(), return_when=asyncio.FIRST_COMPLETED, timeout=12
+        )
+
+        # Cancel pending tasks as we only need the first successful result.
+        for task in pending:
+            task.cancel()
+
+        result = ""
+        for task in done:
+            try:
+                result_candidate = task.result()
+                if result_candidate:
+                    result = result_candidate
+                    break
+            except Exception as e:
+                print(f"Error in one of the tasks: {e}")
+        return result
 
     async def extract_links(self, url: str, domain: str, max_links: int = None, max_time: int = None) -> list:
         """
-        Asynchronously extract unique internal links from the given URL's HTML.
-        'domain' serves as the base for resolving relative paths.
+        Asynchronously extract unique internal links from the page HTML.
         """
         start_time = time.time()
         html = await self.get_html(url)
@@ -189,7 +195,7 @@ class WebScraper:
         soup = BeautifulSoup(html, 'html.parser')
         links = set()
         for a in soup.find_all('a', href=True):
-            if (max_links and len(links) >= max_links) or (max_time and time.time() - start_time > max_time):
+            if (max_links and len(links) >= max_links) or (max_time and (time.time() - start_time > max_time)):
                 break
             link = urljoin(domain, a['href'])
             if link.startswith(domain) and "#" not in link:
@@ -198,47 +204,42 @@ class WebScraper:
 
     async def scrape_text(self, url: str) -> tuple:
         """
-        Asynchronously retrieve and clean full text from a given URL.
-        Uses caching to avoid duplicate downloads.
-        Returns a tuple: (cleaned_text, text_length)
+        Asynchronously retrieve and clean full text from a URL.
+        Returns a tuple (cleaned_text, length). Uses cache to avoid duplicate downloads.
         """
-        cached_response = self.cache.get(url)
-        if cached_response:
-            return cached_response  # Expected tuple: (cleaned_text, length)
+        cached = self.cache.get(url)
+        if cached:
+            return cached
         html = await self.get_html(url)
         if not html:
             return None, 0
         soup = BeautifulSoup(html, 'html.parser')
         texts = soup.get_text()
-        cleaned_text = re.sub(r'\s+', ' ', texts).strip()
-        self.cache.set(url, (cleaned_text, len(cleaned_text)))
-        return cleaned_text, len(cleaned_text)
+        cleaned = re.sub(r'\s+', ' ', texts).strip()
+        self.cache.set(url, (cleaned, len(cleaned)))
+        return cleaned, len(cleaned)
 
     def extract_images(self, html: str, base_url: str) -> list:
         """
-        Extract all image URLs from the HTML by parsing <img> tags and converting them to absolute URLs.
+        Extract image URLs from the HTML by parsing <img> tags and converting them to absolute URLs.
         """
         soup = BeautifulSoup(html, 'html.parser')
         images = []
         for img in soup.find_all('img'):
             src = img.get('src')
             if src:
-                full_url = urljoin(base_url, src)
-                images.append(full_url)
+                images.append(urljoin(base_url, src))
         return images
 
     async def scrape_details(self, url: str) -> dict:
         """
-        Asynchronously scrape detailed information from a single page.
-        Extracts title, a snippet (first 200 characters), full text, and computes a similarity score.
-        Results are cached to reduce redundant scraping.
-
-        Returns a dictionary with:
-          - title, url, content (snippet), score, raw_content.
+        Asynchronously scrape detailed page information.
+        Extracts the title, text snippet, full text, and computes a similarity score.
+        Uses caching to avoid repeated work.
         """
-        cached_response = self.cache.get(url)
-        if cached_response:
-            return cached_response
+        cached = self.cache.get(url)
+        if cached:
+            return cached
         html = await self.get_html(url)
         if not html:
             return {"title": "", "url": url, "content": "", "score": 0.0, "raw_content": ""}
@@ -247,12 +248,12 @@ class WebScraper:
         text = soup.get_text(separator=' ', strip=True)
         cleaned_text = re.sub(r'\s+', ' ', text).strip()
         snippet = cleaned_text[:200] + "..." if len(cleaned_text) > 200 else cleaned_text
-        similarity_score = compute_similarity(self.query, cleaned_text) if self.query else 0.0
+        score = compute_similarity(self.query, cleaned_text) if self.query else 0.0
         result = {
             "title": title,
             "url": url,
             "content": snippet,
-            "score": round(similarity_score, 8),
+            "score": round(score, 8),
             "raw_content": cleaned_text
         }
         self.cache.set(url, result)
@@ -260,13 +261,11 @@ class WebScraper:
 
     async def scrape(self, url: str) -> dict:
         """
-        Asynchronously scrape the main page at 'url':
-          - Retrieve rendered HTML via the tiered methods.
-          - Optionally extract image URLs if include_images is True.
-          - Extract internal links and scrape detailed information for each linked page.
-
-        Returns a dictionary with:
-          - query, images, results (list of detailed page info), and response_time.
+        Asynchronously scrape the main page for 'url':
+          - Retrieve rendered HTML using the concurrent tiered method.
+          - Optionally extract image URLs.
+          - Extract internal links and concurrently scrape details for each link (limited by semaphore).
+        Returns a dictionary with the query, images, results, and response time.
         """
         start_time = time.time()
         html = await self.get_html(url)
@@ -274,14 +273,18 @@ class WebScraper:
             return {"error": f"Unable to retrieve main page content for {url}"}
         images = self.extract_images(html, url) if self.include_images else []
         links = await self.extract_links(url, url)
-        results = []
-        for link in links:
-            details = await self.scrape_details(link)
-            results.append(details)
+
+        # Use semaphore to limit concurrency when scraping internal link details.
+        async def safe_scrape(link):
+            async with self.semaphore:
+                return await self.scrape_details(link)
+
+        tasks = [asyncio.create_task(safe_scrape(link)) for link in links]
+        details_list = await asyncio.gather(*tasks)
         response_time = round(time.time() - start_time, 2)
         return {
             "query": self.query,
             "images": images,
-            "results": results,
+            "results": details_list,
             "response_time": response_time
         }
