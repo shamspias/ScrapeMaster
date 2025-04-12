@@ -1,38 +1,76 @@
+"""
+main.py
+-------
+This module sets up the FastAPI application and defines the /scrape endpoint.
+Clients send a POST payload with one or more URLs plus an optional query.
+If no URLs are provided, a 400 error is returned.
+
+To run the service locally:
+   uvicorn app.main:app --reload
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import logging
+from typing import List, Optional
+import asyncio
 
-from app.scraper import PerfectWebScraper
-
-
-class ScrapeRequest(BaseModel):
-    urls: list[str]
-    query: str = ""
-
+from app.scraper import WebScraper
 
 app = FastAPI(
-    title="ScrapeMaster Microservice",
-    description="A microservice to scrape website content using Selenium and Requests.",
+    title="Web Scraper Microservice",
+    description="Scrape website content using a tiered approach: Splash (JS enabled) first, then Selenium fallback, then simple requests.",
     version="1.0"
 )
 
 
-@app.post("/scrape", summary="Scrape one or multiple URLs")
+class ScrapeRequest(BaseModel):
+    urls: Optional[List[str]] = None
+    query: Optional[str] = ""
+
+
+@app.post("/scrape", summary="Scrape one or more URLs")
 async def scrape_urls(request: ScrapeRequest):
-    if not request.urls:
+    """
+    Endpoint to scrape website(s). Expects a JSON payload with one or more URLs and an optional query.
+
+    Returns a JSON response with the following structure:
+
+    {
+      "results": [
+         {
+           "query": "<query provided>",
+           "images": [ "img_url_1", "img_url_2", ... ],
+           "results": [
+              {
+                "title": "Page Title",
+                "url": "http://example.com/page",
+                "content": "Snippet from the page...",
+                "score": 0.7654321,
+                "raw_content": "Full page text..."
+              },
+              ...
+           ],
+           "response_time": 12.34
+         },
+         ...
+      ]
+    }
+
+    If no URLs are provided, an HTTP 400 error is returned.
+    """
+    if not request.urls or len(request.urls) == 0:
         raise HTTPException(status_code=400, detail="No URLs provided to scrape.")
 
-    aggregated_results = []
+    tasks = []
     for url in request.urls:
-        logging.info("Scraping URL: %s", url)
-        scraper = PerfectWebScraper(url=url, query=request.query)
-        result = scraper.scrape()
-        aggregated_results.append(result)
+        scraper = WebScraper(query=request.query)
+        tasks.append(scraper.scrape(url))
 
-    return {"results": aggregated_results}
+    results = await asyncio.gather(*tasks)
+    return {"results": results}
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
