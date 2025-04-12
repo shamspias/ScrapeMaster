@@ -230,14 +230,14 @@ class WebScraper:
         """
         soup = BeautifulSoup(html, 'html.parser')
         images = []
-        allowed_ext = ('.png', '.jpg', '.jpeg')
+        disallowed_ext = '.svg'
         for img in soup.find_all('img'):
             src = img.get('src')
             if src:
                 # Convert relative URLs to absolute URLs using the base_url
                 full_url = urljoin(base_url, src)
                 # Check if the URL ends with one of the allowed extensions (case-insensitive)
-                if full_url.lower().endswith(allowed_ext):
+                if not full_url.lower().endswith(disallowed_ext):
                     images.append(full_url)
         return images
 
