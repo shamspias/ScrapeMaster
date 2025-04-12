@@ -225,9 +225,9 @@ class WebScraper:
 
     def extract_images(self, html: str, base_url: str) -> list:
         """
-        Extract image URLs from the HTML by parsing <img> tags and converting relative URLs to absolute.
-        Filters out disallowed extensions (.svg) and URLs containing words like 'logo' or 'icon'.
-        Returns up to the last 5 valid image URLs.
+        Extract up to the first 5 valid image URLs from HTML.
+        Converts relative URLs to absolute, skips disallowed extensions (.svg),
+        and filters out URLs containing 'logo' or 'icon'.
         """
         if not html:
             return []
@@ -238,15 +238,25 @@ class WebScraper:
         disallowed_keywords = ['logo', 'icon']
 
         for img in soup.find_all('img'):
-            src = img.get('src')
-            if src:
-                full_url = urljoin(base_url, src)
-                lower_url = full_url.lower()
-                if not lower_url.endswith(disallowed_ext) and not any(
-                        keyword in lower_url for keyword in disallowed_keywords):
-                    images.append(full_url)
+            if len(images) >= 5:
+                break
 
-        return images[5:]  # Return last 5 (or fewer) valid image URLs
+            src = img.get('src')
+            if not src:
+                continue
+
+            full_url = urljoin(base_url, src)
+            lower_url = full_url.lower()
+
+            if lower_url.endswith(disallowed_ext):
+                continue
+
+            if any(keyword in lower_url for keyword in disallowed_keywords):
+                continue
+
+            images.append(full_url)
+
+        return images
 
     async def scrape_details(self, url: str) -> dict:
         """
