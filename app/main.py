@@ -2,8 +2,8 @@
 main.py
 -------
 This module sets up the FastAPI application and defines the /scrape endpoint.
-Clients send a POST payload with one or more URLs plus an optional query.
-If no URLs are provided, a 400 error is returned.
+Clients submit a POST payload with one or more URLs, an optional query, and an optional flag
+to include image extraction (default is false).
 
 To run the service locally:
    uvicorn app.main:app --reload
@@ -18,7 +18,11 @@ from app.scraper import WebScraper
 
 app = FastAPI(
     title="Web Scraper Microservice",
-    description="Scrape website content using a tiered approach: Splash (JS enabled) first, then Selenium fallback, then simple requests.",
+    description=(
+        "Scrape website content using a tiered approach: Splash (JS enabled) first, "
+        "then Selenium fallback, and finally, a simple requests-based method. "
+        "Optionally include image extraction."
+    ),
     version="1.0"
 )
 
@@ -26,12 +30,20 @@ app = FastAPI(
 class ScrapeRequest(BaseModel):
     urls: Optional[List[str]] = None
     query: Optional[str] = ""
+    include_images: Optional[bool] = False  # Default is false, meaning images are not scraped.
 
 
 @app.post("/scrape", summary="Scrape one or more URLs")
 async def scrape_urls(request: ScrapeRequest):
     """
-    Endpoint to scrape website(s). Expects a JSON payload with one or more URLs and an optional query.
+    Endpoint to scrape website(s). Expects a JSON payload with one or more URLs, an optional query,
+    and an optional include_images flag. Example payload:
+
+    {
+      "urls": ["https://example.com"],
+      "query": "sample query",
+      "include_images": true
+    }
 
     Returns a JSON response with the following structure:
 
@@ -63,7 +75,7 @@ async def scrape_urls(request: ScrapeRequest):
 
     tasks = []
     for url in request.urls:
-        scraper = WebScraper(query=request.query)
+        scraper = WebScraper(query=request.query, include_images=request.include_images)
         tasks.append(scraper.scrape(url))
 
     results = await asyncio.gather(*tasks)
