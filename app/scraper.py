@@ -246,7 +246,7 @@ class WebScraper:
                         keyword in lower_url for keyword in disallowed_keywords):
                     images.append(full_url)
 
-        return images[-5:]  # Return last 5 (or fewer) valid image URLs
+        return images[5:]  # Return last 5 (or fewer) valid image URLs
 
     async def scrape_details(self, url: str) -> dict:
         """
