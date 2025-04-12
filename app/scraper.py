@@ -1,20 +1,16 @@
 """
-This module contains the WebScraper class, which first attempts to retrieve a JavaScript‐enabled
-HTML page via a Splash service (the same technique often used with Scrapy–Splash). If that fails,
-it falls back to using Selenium with headless Chrome. If Selenium also fails, it finally falls back
-to a simple requests-based scraper.
+This module contains the WebScraper class, which implements a tiered approach
+for scraping web pages. It first attempts to retrieve rendered HTML via a Splash service
+(with JavaScript enabled). If that fails, it falls back to Selenium (Chrome in headless mode)
+and, finally, to a simple requests-based scraper. Caching is used to limit repeat requests.
 
-This design provides a tiered approach:
-    1. Splash (Scrapy style, JS enabled)
-    2. Selenium
-    3. Fallback: Requests (wrapped in asyncio.to_thread)
-
-The module also implements caching (via cache_manager.Cache) so that pages are not re-scraped too often.
+An option is provided to include image extraction, which is disabled by default.
+If enabled, the scraper extracts image URLs from the page.
 
 Ensure you have:
- - A running Splash service (e.g., docker run -p 8050:8050 scrapinghub/splash)
- - Google Chrome and ChromeDriver installed (for Selenium)
- - The required Python packages installed as per requirements.txt
+  - A running Splash service (e.g., via Docker: docker run -p 8050:8050 scrapinghub/splash)
+  - Google Chrome (or Chromium) and ChromeDriver installed for Selenium
+  - The required Python packages, as specified in requirements.txt
 """
 
 import random
@@ -38,20 +34,20 @@ from app.cache_manager import Cache
 def compute_similarity(text1: str, text2: str) -> float:
     """
     Compute similarity between two strings using SequenceMatcher.
-    Returns a float value between 0 and 1.
+    Returns a float between 0 and 1.
     """
     return SequenceMatcher(None, text1, text2).ratio()
 
 
 class WebScraper:
     """
-    WebScraper encapsulates a tiered approach for scraping web pages:
-      1. Uses Splash (a headless browser service often paired with Scrapy) with JavaScript enabled.
-      2. Falls back to Selenium (Chrome, headless) if Splash fails.
-      3. Falls back to a simple requests method as a last resort.
+    WebScraper implements a multi-tiered strategy for scraping websites:
+      1. Splash (JS enabled) - ideal for dynamic pages.
+      2. Selenium (Chrome in headless mode) - fallback if Splash fails.
+      3. Requests - final fallback if all else fails.
 
-    It exposes asynchronous methods to retrieve HTML, extract links and images,
-    and to scrape detailed page information.
+    It extracts page details such as title, text snippet, full text, and computes a similarity score
+    against an optional query. Additionally, image extraction can be enabled via the include_images flag.
     """
 
     # Predefined user agents for rotation.
@@ -61,18 +57,21 @@ class WebScraper:
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.164 Safari/537.36',
     ]
 
-    def __init__(self, query: str = "") -> None:
+    def __init__(self, query: str = "", include_images: bool = False) -> None:
         """
-        Initialize the WebScraper with an optional query (used for computing text similarity).
+        Initialize the scraper with an optional query for similarity scoring and an image extraction flag.
+        :param query: Optional string to compare against page content.
+        :param include_images: If True, image URLs will be extracted.
         """
         self.executor = ThreadPoolExecutor(max_workers=10)
         self.cache = Cache(expiry=60)  # Cache expiry set to 60 seconds
         self.query = query
+        self.include_images = include_images
 
     def create_driver(self):
         """
         Create and return a Selenium Chrome WebDriver instance in headless mode
-        using a random user agent.
+        with a randomly selected user agent.
         """
         options = Options()
         options.add_argument('--headless')
@@ -86,7 +85,7 @@ class WebScraper:
 
     def change_user_agent(self, options):
         """
-        Apply a randomly selected user agent to the WebDriver options.
+        Randomly select and apply one of the predefined user agents.
         """
         try:
             random_user_agent = random.choice(self.USER_AGENTS)
@@ -98,7 +97,7 @@ class WebScraper:
     async def get_html_using_splash(self, url: str) -> str:
         """
         Attempt to retrieve the HTML of a URL using a Splash service.
-        This is run in a thread to avoid blocking the event loop.
+        This is executed in a thread to avoid blocking the event loop.
         """
         return await asyncio.to_thread(self._get_html_using_splash, url)
 
@@ -120,17 +119,17 @@ class WebScraper:
 
     async def get_html(self, url: str) -> str:
         """
-        Asynchronously retrieve the HTML content of a page. The steps are:
-          1. Attempt to fetch using Splash (with JS enabled).
-          2. If that fails (empty result), try using Selenium.
-          3. If Selenium also fails, use a fallback requests-based scraper.
+        Asynchronously retrieve the HTML content of a page.
+          1. Try Splash (JS enabled).
+          2. If Splash fails, attempt Selenium.
+          3. If Selenium fails, use a fallback requests-based scraper.
         """
-        # First try Splash
+        # First, attempt with Splash.
         html = await self.get_html_using_splash(url)
         if html:
             return html
 
-        # Next, try Selenium
+        # Next, try Selenium.
         driver = None
         try:
             driver = self.create_driver()
@@ -155,18 +154,18 @@ class WebScraper:
                 except Exception:
                     pass
 
-        # Finally, use fallback (requests) if both methods failed
+        # Finally, use the fallback method (requests).
         return await self.fallback_get_html(url)
 
     async def fallback_get_html(self, url: str) -> str:
         """
-        Asynchronously perform a fallback HTML retrieval using the requests library.
+        Asynchronously retrieve HTML using the requests library as a final fallback.
         """
         return await asyncio.to_thread(self._fallback_get_html, url)
 
     def _fallback_get_html(self, url: str) -> str:
         """
-        Synchronously retrieve HTML using requests as a last resort.
+        Synchronously retrieve HTML using requests.
         """
         import requests
         try:
@@ -180,9 +179,8 @@ class WebScraper:
 
     async def extract_links(self, url: str, domain: str, max_links: int = None, max_time: int = None) -> list:
         """
-        Asynchronously extract unique internal links from the URL using the rendered HTML.
-        'domain' is used as the base URL for resolving relative paths.
-        Optional max_links and max_time can limit extraction.
+        Asynchronously extract unique internal links from the given URL's HTML.
+        'domain' serves as the base for resolving relative paths.
         """
         start_time = time.time()
         html = await self.get_html(url)
@@ -201,7 +199,8 @@ class WebScraper:
     async def scrape_text(self, url: str) -> tuple:
         """
         Asynchronously retrieve and clean full text from a given URL.
-        Results are cached. Returns a tuple (cleaned_text, length).
+        Uses caching to avoid duplicate downloads.
+        Returns a tuple: (cleaned_text, text_length)
         """
         cached_response = self.cache.get(url)
         if cached_response:
@@ -217,8 +216,7 @@ class WebScraper:
 
     def extract_images(self, html: str, base_url: str) -> list:
         """
-        Extract all image URLs from the HTML by parsing <img> tags and converting any relative URL
-        to an absolute one using the base URL.
+        Extract all image URLs from the HTML by parsing <img> tags and converting them to absolute URLs.
         """
         soup = BeautifulSoup(html, 'html.parser')
         images = []
@@ -231,11 +229,11 @@ class WebScraper:
 
     async def scrape_details(self, url: str) -> dict:
         """
-        Asynchronously scrape detailed information from a page.
-        Extracts the title, a text snippet, full text, and computes a similarity score.
-        Results are cached.
+        Asynchronously scrape detailed information from a single page.
+        Extracts title, a snippet (first 200 characters), full text, and computes a similarity score.
+        Results are cached to reduce redundant scraping.
 
-        Returns a dictionary with keys:
+        Returns a dictionary with:
           - title, url, content (snippet), score, raw_content.
         """
         cached_response = self.cache.get(url)
@@ -263,18 +261,18 @@ class WebScraper:
     async def scrape(self, url: str) -> dict:
         """
         Asynchronously scrape the main page at 'url':
-           - Retrieve the rendered HTML.
-           - Extract all images.
-           - Extract internal links and scrape each one for details.
+          - Retrieve rendered HTML via the tiered methods.
+          - Optionally extract image URLs if include_images is True.
+          - Extract internal links and scrape detailed information for each linked page.
 
         Returns a dictionary with:
-           - query, images, results (list of page details), response_time.
+          - query, images, results (list of detailed page info), and response_time.
         """
         start_time = time.time()
         html = await self.get_html(url)
         if not html:
             return {"error": f"Unable to retrieve main page content for {url}"}
-        images = self.extract_images(html, url)
+        images = self.extract_images(html, url) if self.include_images else []
         links = await self.extract_links(url, url)
         results = []
         for link in links:
