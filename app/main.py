@@ -1,6 +1,4 @@
 """
-main.py
--------
 This module sets up the FastAPI microservice with the /scrape endpoint.
 Clients send a POST payload with one or more URLs, an optional query,
 and an optional include_images flag (default false). The service returns a JSON response.
