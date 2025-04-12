@@ -225,14 +225,20 @@ class WebScraper:
 
     def extract_images(self, html: str, base_url: str) -> list:
         """
-        Extract image URLs from the HTML by parsing <img> tags and converting them to absolute URLs.
+        Extract image URLs from the HTML by parsing <img> tags and converting relative URLs to absolute.
+        Only images ending with allowed extensions (.png, .jpg, .jpeg) are included.
         """
         soup = BeautifulSoup(html, 'html.parser')
         images = []
+        allowed_ext = ('.png', '.jpg', '.jpeg')
         for img in soup.find_all('img'):
             src = img.get('src')
             if src:
-                images.append(urljoin(base_url, src))
+                # Convert relative URLs to absolute URLs using the base_url
+                full_url = urljoin(base_url, src)
+                # Check if the URL ends with one of the allowed extensions (case-insensitive)
+                if full_url.lower().endswith(allowed_ext):
+                    images.append(full_url)
         return images
 
     async def scrape_details(self, url: str) -> dict:
