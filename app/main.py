@@ -1,11 +1,10 @@
 """
 main.py
 -------
-This module sets up the FastAPI application and defines the /scrape endpoint.
-Clients submit a POST payload with one or more URLs, an optional query, and an optional flag
-to include image extraction (default is false).
-
-To run the service locally:
+This module sets up the FastAPI microservice with the /scrape endpoint.
+Clients send a POST payload with one or more URLs, an optional query,
+and an optional include_images flag (default false). The service returns a JSON response.
+To run locally:
    uvicorn app.main:app --reload
 """
 
@@ -19,9 +18,10 @@ from app.scraper import WebScraper
 app = FastAPI(
     title="Web Scraper Microservice",
     description=(
-        "Scrape website content using a tiered approach: Splash (JS enabled) first, "
-        "then Selenium fallback, and finally, a simple requests-based method. "
-        "Optionally include image extraction."
+        "Scrape website content using a tiered, concurrent approach: "
+        "Splash (JS-enabled) is raced against Selenium and a simple aiohttp fallback. "
+        "Internal links are processed concurrently with a semaphore limit, "
+        "and image extraction is optional."
     ),
     version="1.0"
 )
@@ -30,13 +30,13 @@ app = FastAPI(
 class ScrapeRequest(BaseModel):
     urls: Optional[List[str]] = None
     query: Optional[str] = ""
-    include_images: Optional[bool] = False  # Default is false, meaning images are not scraped.
+    include_images: Optional[bool] = False
 
 
 @app.post("/scrape", summary="Scrape one or more URLs")
 async def scrape_urls(request: ScrapeRequest):
     """
-    Endpoint to scrape website(s). Expects a JSON payload with one or more URLs, an optional query,
+    Endpoint to scrape website(s). Clients provide one or more URLs, an optional query,
     and an optional include_images flag. Example payload:
 
     {
@@ -45,30 +45,8 @@ async def scrape_urls(request: ScrapeRequest):
       "include_images": true
     }
 
-    Returns a JSON response with the following structure:
-
-    {
-      "results": [
-         {
-           "query": "<query provided>",
-           "images": [ "img_url_1", "img_url_2", ... ],
-           "results": [
-              {
-                "title": "Page Title",
-                "url": "http://example.com/page",
-                "content": "Snippet from the page...",
-                "score": 0.7654321,
-                "raw_content": "Full page text..."
-              },
-              ...
-           ],
-           "response_time": 12.34
-         },
-         ...
-      ]
-    }
-
-    If no URLs are provided, an HTTP 400 error is returned.
+    Returns a JSON object with:
+      - query, images (if enabled), results (each with page details), and response_time.
     """
     if not request.urls or len(request.urls) == 0:
         raise HTTPException(status_code=400, detail="No URLs provided to scrape.")
