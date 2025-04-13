@@ -2,11 +2,13 @@
 This module contains the WebScraper class which implements a high-performance scraping strategy
 by conditionally using Playwright (headless Chromium) or a combination of Splash (JS-enabled) plus
 aiohttp fallback. A new parameter 'browser_enabled' controls whether Playwright is used exclusively
-or not at all.
+or not at all. Additionally, if the non‑browser methods yield empty content, the code automatically
+falls back to Playwright mode.
 
 Features:
   - If browser_enabled is True: Only Playwright is used.
   - If browser_enabled is False: Splash and an aiohttp fallback are raced concurrently.
+  - If raw_content (cleaned page text) is empty, automatically fall back to Playwright mode.
   - Optional image extraction (controlled by include_images).
 
 Requirements:
@@ -46,6 +48,9 @@ class WebScraper:
       - If browser_enabled is False: Splash (JS-enabled via aiohttp) and a fallback aiohttp
         method are raced concurrently.
 
+    If the resulting raw content (cleaned text) is empty when not using browser mode, it falls back
+    automatically to using Playwright.
+
     Image extraction is optional.
     """
 
@@ -70,7 +75,7 @@ class WebScraper:
     async def get_html_using_playwright(self, url: str) -> str:
         """
         Asynchronously retrieve rendered HTML using Playwright in headless mode.
-        Uses "networkidle" waiting and an additional brief sleep to allow full rendering.
+        Uses "networkidle" waiting and a brief sleep to allow full rendering.
         """
         try:
             async with async_playwright() as p:
@@ -160,20 +165,15 @@ class WebScraper:
         for img in soup.find_all('img'):
             if len(images) >= 5:
                 break
-
             src = img.get('src')
             if not src:
                 continue
-
             full_url = urljoin(base_url, src)
             lower_url = full_url.lower()
-
             if lower_url.endswith(disallowed_ext):
                 continue
-
             if any(keyword in lower_url for keyword in disallowed_keywords):
                 continue
-
             images.append(full_url)
 
         return images
@@ -181,19 +181,42 @@ class WebScraper:
     async def scrape_details(self, url: str) -> dict:
         """
         Asynchronously scrape detailed page information.
-        Extracts the title, a snippet, full text, and computes a similarity score against the query.
+        Extracts the title, a snippet, full text (raw_content), and computes a similarity score against the query.
+
+        If the initial result is empty (raw_content is an empty string) and browser_enabled is False,
+        it automatically falls back to using Playwright.
         Results are cached.
         """
         cached = self.cache.get(url)
         if cached:
             return cached
+
+        # First attempt: get HTML using the chosen method.
         html = await self.get_html(url)
+        # If html is empty, try browser fallback automatically if we're not already in browser mode.
+        if (not html or not html.strip()) and not self.browser_enabled:
+            print(f"Fallback: raw HTML empty for {url}, trying Playwright mode.")
+            html = await self.get_html_using_playwright(url)
+
         if not html:
-            return {"title": "", "url": url, "content": "", "score": 0.0, "raw_content": ""}
+            result = {"title": "", "url": url, "content": "", "score": 0.0, "raw_content": ""}
+            self.cache.set(url, result)
+            return result
+
         soup = BeautifulSoup(html, 'html.parser')
-        title = soup.title.string.strip() if soup.title and soup.title.string else ""
         text = soup.get_text(separator=' ', strip=True)
         cleaned_text = re.sub(r'\s+', ' ', text).strip()
+
+        # If raw content is empty after cleaning and we haven't used browser fallback, try Playwright once.
+        if not cleaned_text and not self.browser_enabled:
+            print(f"Fallback: raw content empty for {url}, trying Playwright mode.")
+            html_alt = await self.get_html_using_playwright(url)
+            if html_alt:
+                soup = BeautifulSoup(html_alt, 'html.parser')
+                text = soup.get_text(separator=' ', strip=True)
+                cleaned_text = re.sub(r'\s+', ' ', text).strip()
+
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
         snippet = cleaned_text[:200] + "..." if len(cleaned_text) > 200 else cleaned_text
         score = compute_similarity(self.query, cleaned_text) if self.query else 0.0
         result = {
@@ -211,7 +234,8 @@ class WebScraper:
         Asynchronously scrape the main page from 'url':
           - Retrieve rendered HTML using the selected method.
           - Optionally extract image URLs.
-          - Scrape the details of the page (without extracting internal links).
+          - Scrape only the details of the page provided without extracting internal links.
+
         Returns a dictionary with the query, images (if enabled), the page details, and total response time.
         """
         start_time = time.time()
@@ -219,7 +243,6 @@ class WebScraper:
         if not html:
             return {"error": f"Unable to retrieve main page content for {url}"}
         images = self.extract_images(html, url) if self.include_images else []
-        # Directly scrape details from the provided URL without extracting internal links.
         details = await self.scrape_details(url)
         response_time = round(time.time() - start_time, 2)
         return {
