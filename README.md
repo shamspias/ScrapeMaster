@@ -1,15 +1,15 @@
 # ScrapeMaster
 
-ScrapeMaster is a FastAPI microservice for web scraping that extracts images and page content from a list of URLs using a tiered approach. It first attempts to retrieve JavaScript-rendered pages via Splash (a Scrapy-style solution), then falls back to Selenium (in headless mode) and finally, if needed, to a simple Requests-based scraper. Caching is used to improve performance and avoid re-scraping pages too often.
+ScrapeMaster is a FastAPI microservice for web scraping that extracts images and page content from a list of URLs using a tiered approach. It first attempts to retrieve JavaScript-rendered pages via Splash (a Scrapy-style solution) or a simple aiohttp-based scraper, and if those methods yield empty content, it automatically falls back to using Playwright (headless Chromium) to ensure complete page rendering. Caching is used to improve performance and to avoid re-scraping pages too often.
 
 ## Features
 
 - **Tiered Scraping:**  
   - **Splash (JS Enabled):** Uses a Splash service to render pages with JavaScript.
-  - **Selenium Fallback:** If Splash fails, falls back to Selenium with Chrome in headless mode.
-  - **Requests Fallback:** If Selenium also fails, uses a simple requests-based scraper.
-- **Image Extraction:** Scrapes all image URLs from the main page.
-- **Content Extraction:** Retrieves internal links and processes each page to extract the title, text snippet, full text, and compute a similarity score based on an optional query.
+  - **aiohttp Fallback:** If Splash fails, uses an aiohttp-based scraper.
+  - **Playwright Auto-Fallback:** If the above methods return empty content, ScrapeMaster automatically falls back to Playwright (headless Chromium) to capture the fully rendered page.
+- **Image Extraction:** Optionally scrapes image URLs from the main page.
+- **Content Extraction:** Retrieves the title, a text snippet, full page content, and a similarity score based on an optional query for the provided URL(s) without following internal links.
 - **Caching:** Caches results to reduce redundant requests and speed up subsequent scrapes.
 - **Flexible HTTP Handling:** Ensures robust scraping even against dynamic or protected web pages.
 
@@ -18,9 +18,8 @@ ScrapeMaster is a FastAPI microservice for web scraping that extracts images and
 ### Prerequisites
 
 - Python 3.11+
-- Google Chrome installed
-- [ChromeDriver](https://chromedriver.chromium.org/downloads) corresponding to your version of Chrome
 - [Docker](https://docs.docker.com/get-docker/) (required to run Splash)
+- Playwright installed for Python (see below)
 
 ### Installation
 
@@ -49,25 +48,11 @@ ScrapeMaster is a FastAPI microservice for web scraping that extracts images and
    ```
    This will expose Splash at `http://localhost:8050` for JavaScript rendering.
 
-5. **Install Google Chrome & ChromeDriver (if not already installed):**
-
-   **Google Chrome:**
+5. **Install Playwright:**
    ```bash
-   sudo apt update
-   sudo apt install -y google-chrome-stable
+   pip install playwright
+   playwright install
    ```
-
-   **ChromeDriver:**
-   - Check your Chrome version:
-     ```bash
-     google-chrome --version
-     ```
-   - Download the corresponding version of ChromeDriver from [ChromeDriver Downloads](https://chromedriver.chromium.org/downloads)
-   - Unzip and install:
-     ```bash
-     sudo mv chromedriver /usr/local/bin/
-     sudo chmod +x /usr/local/bin/chromedriver
-     ```
 
 6. **Run the Application:**
    ```bash
@@ -84,9 +69,15 @@ Send a POST request to the `/scrape` endpoint with a JSON payload containing an 
   "urls": [
     "https://example.com"
   ],
-  "query": "sample query"
+  "query": "sample query",
+  "include_images": true,
+  "browser_enabled": false
 }
 ```
+
+- When `browser_enabled` is set to `false` (the default), the service will first attempt to scrape using Splash and aiohttp.  
+- If the returned raw content is empty, it automatically falls back to using Playwright, ensuring that pages with heavy JavaScript get rendered.
+- When `browser_enabled` is set to `true`, the service directly uses Playwright for page rendering.
 
 The service responds with a JSON object in the following structure:
 
@@ -99,15 +90,13 @@ The service responds with a JSON object in the following structure:
         "https://example.com/image1.jpg",
         "https://example.com/image2.jpg"
       ],
-      "results": [
-        {
-          "title": "Page Title",
-          "url": "https://example.com/page",
-          "content": "Snippet from the page...",
-          "score": 0.7654321,
-          "raw_content": "Full page text..."
-        }
-      ],
+      "result": {
+        "title": "Page Title",
+        "url": "https://example.com",
+        "content": "Snippet from the page...",
+        "score": 0.7654321,
+        "raw_content": "Full page text..."
+      },
       "response_time": 12.34
     }
   ]
