@@ -1,19 +1,18 @@
 """
 This module contains the WebScraper class which implements a high-performance scraping strategy
-by conditionally using Selenium (headless Chrome) or a combination of Splash (JS-enabled) plus
-aiohttp fallback. A new parameter 'browser_enabled' controls whether Selenium is used exclusively
+by conditionally using Playwright (headless Chromium) or a combination of Splash (JS-enabled) plus
+aiohttp fallback. A new parameter 'browser_enabled' controls whether Playwright is used exclusively
 or not at all.
 
 Features:
-  - If browser_enabled is True: Only Selenium is used.
+  - If browser_enabled is True: Only Playwright is used.
   - If browser_enabled is False: Splash and an aiohttp fallback are raced concurrently.
-  - Concurrent processing of internal links via a semaphore.
   - Optional image extraction (controlled by include_images).
 
 Requirements:
-  - A running Splash service (e.g., via docker run -p 8050:8050 scrapinghub/splash)
-  - Google Chrome (or Chromium) and ChromeDriver installed for Selenium
-  - Python packages: aiohttp, selenium, beautifulsoup4, etc.
+  - A running Splash service (e.g., via: docker run -p 8050:8050 scrapinghub/splash)
+  - Playwright installed for Python (pip install playwright) and its browsers installed (playwright install)
+  - Python packages: aiohttp, playwright, beautifulsoup4, etc.
 """
 
 import random
@@ -25,16 +24,9 @@ from difflib import SequenceMatcher
 
 import aiohttp
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from playwright.async_api import async_playwright
 
 from app.cache_manager import Cache
-
-# Limit concurrent internal link scrapes (tweak as needed)
-SEM_MAX_CONCURRENT = 10
 
 
 def compute_similarity(text1: str, text2: str) -> float:
@@ -50,12 +42,11 @@ class WebScraper:
     WebScraper implements a strategy for fast scraping.
     It uses one of two modes based on the 'browser_enabled' flag:
 
-      - If browser_enabled is True: Only Selenium (Chrome in headless mode) is used.
+      - If browser_enabled is True: Only Playwright (headless Chromium) is used.
       - If browser_enabled is False: Splash (JS-enabled via aiohttp) and a fallback aiohttp
-        method are raced concurrently (Selenium is not used).
+        method are raced concurrently.
 
-    Internal link extraction is done concurrently (limited by a semaphore), and image extraction
-    is optional.
+    Image extraction is optional.
     """
 
     USER_AGENTS = [
@@ -69,38 +60,32 @@ class WebScraper:
         Initialize the scraper with:
           - query: Optional text to compare against page content.
           - include_images: If True, image URLs are extracted.
-          - browser_enabled: If True, only Selenium is used; if False, Selenium is skipped.
+          - browser_enabled: If True, only Playwright is used; if False, Splash + fallback are used.
         """
         self.cache = Cache(expiry=60)
         self.query = query
         self.include_images = include_images
         self.browser_enabled = browser_enabled
-        self.semaphore = asyncio.Semaphore(SEM_MAX_CONCURRENT)
 
-    def create_driver(self):
+    async def get_html_using_playwright(self, url: str) -> str:
         """
-        Create and return a Selenium Chrome WebDriver instance in headless mode with a random user agent.
-        """
-        options = Options()
-        options.add_argument('--headless')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--window-size=1920,1080')
-        options.add_argument('--disable-extensions')
-        options.add_argument('--no-sandbox')
-        options.add_argument('--disable-dev-shm-usage')
-        self.change_user_agent(options)
-        return webdriver.Chrome(options=options)
-
-    def change_user_agent(self, options):
-        """
-        Randomly choose and apply a user agent to the Selenium options.
+        Asynchronously retrieve rendered HTML using Playwright in headless mode.
+        Uses "networkidle" waiting and an additional brief sleep to allow full rendering.
         """
         try:
-            ua = random.choice(self.USER_AGENTS)
-            print(f"Using user agent: {ua}")
-            options.add_argument(f'user-agent={ua}')
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                # Create a browser context with a random user agent.
+                context = await browser.new_context(user_agent=random.choice(self.USER_AGENTS))
+                page = await context.new_page()
+                await page.goto(url, wait_until="networkidle", timeout=15000)
+                await asyncio.sleep(1)
+                html = await page.content()
+                await browser.close()
+                return html
         except Exception as e:
-            print(f"Error setting user agent: {e}")
+            print(f"Playwright error for {url}: {e}")
+            return ""
 
     async def get_html_using_splash(self, url: str) -> str:
         """
@@ -115,35 +100,6 @@ class WebScraper:
                         return await response.text()
         except Exception as e:
             print(f"Splash error for {url}: {e}")
-        return ""
-
-    async def get_html_using_selenium(self, url: str) -> str:
-        """
-        Asynchronously retrieve HTML using Selenium (wrapped in asyncio.to_thread).
-        """
-        return await asyncio.to_thread(self._get_html_using_selenium, url)
-
-    def _get_html_using_selenium(self, url: str) -> str:
-        """
-        Synchronously retrieve HTML using Selenium.
-        """
-        driver = None
-        try:
-            driver = self.create_driver()
-            driver.get(url)
-            WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-            html = driver.page_source
-            driver.quit()
-            return html
-        except Exception as e:
-            print(f"Selenium error for {url}: {e}")
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
         return ""
 
     async def fallback_get_html(self, url: str) -> str:
@@ -163,11 +119,11 @@ class WebScraper:
     async def get_html(self, url: str) -> str:
         """
         Retrieve the HTML content of a page according to the browser_enabled flag:
-          - If browser_enabled is True: use only Selenium.
+          - If browser_enabled is True: use only Playwright.
           - Otherwise: concurrently run Splash and fallback methods and return the first nonempty result.
         """
         if self.browser_enabled:
-            return await self.get_html_using_selenium(url)
+            return await self.get_html_using_playwright(url)
         else:
             tasks = {
                 "splash": asyncio.create_task(self.get_html_using_splash(url)),
@@ -186,42 +142,6 @@ class WebScraper:
                 except Exception as e:
                     print(f"Error in task: {e}")
             return result
-
-    async def extract_links(self, url: str, domain: str, max_links: int = None, max_time: int = None) -> list:
-        """
-        Asynchronously extract unique internal links from the page HTML.
-        'domain' is used to resolve relative paths.
-        """
-        start_time = time.time()
-        html = await self.get_html(url)
-        if not html:
-            return []
-        soup = BeautifulSoup(html, 'html.parser')
-        links = set()
-        for a in soup.find_all('a', href=True):
-            if (max_links and len(links) >= max_links) or (max_time and (time.time() - start_time > max_time)):
-                break
-            link = urljoin(domain, a['href'])
-            if link.startswith(domain) and "#" not in link:
-                links.add(link)
-        return list(links)
-
-    async def scrape_text(self, url: str) -> tuple:
-        """
-        Asynchronously retrieve and clean full text from a URL.
-        Returns a tuple: (cleaned_text, length) using the cache to avoid redundancy.
-        """
-        cached = self.cache.get(url)
-        if cached:
-            return cached
-        html = await self.get_html(url)
-        if not html:
-            return None, 0
-        soup = BeautifulSoup(html, 'html.parser')
-        texts = soup.get_text()
-        cleaned = re.sub(r'\s+', ' ', texts).strip()
-        self.cache.set(url, (cleaned, len(cleaned)))
-        return cleaned, len(cleaned)
 
     def extract_images(self, html: str, base_url: str) -> list:
         """
@@ -289,29 +209,22 @@ class WebScraper:
     async def scrape(self, url: str) -> dict:
         """
         Asynchronously scrape the main page from 'url':
-          - Retrieve rendered HTML using the selected method (browser_enabled flag applied).
+          - Retrieve rendered HTML using the selected method.
           - Optionally extract image URLs.
-          - Extract internal links and concurrently scrape details for each link (controlled by a semaphore).
-        Returns a dictionary with the query, images (if enabled), results, and total response time.
+          - Scrape the details of the page (without extracting internal links).
+        Returns a dictionary with the query, images (if enabled), the page details, and total response time.
         """
         start_time = time.time()
         html = await self.get_html(url)
         if not html:
             return {"error": f"Unable to retrieve main page content for {url}"}
         images = self.extract_images(html, url) if self.include_images else []
-        links = await self.extract_links(url, url)
-
-        # Concurrency for internal link scraping using a semaphore
-        async def safe_scrape(link):
-            async with self.semaphore:
-                return await self.scrape_details(link)
-
-        tasks = [asyncio.create_task(safe_scrape(link)) for link in links]
-        details_list = await asyncio.gather(*tasks)
+        # Directly scrape details from the provided URL without extracting internal links.
+        details = await self.scrape_details(url)
         response_time = round(time.time() - start_time, 2)
         return {
             "query": self.query,
             "images": images,
-            "results": details_list,
+            "result": details,
             "response_time": response_time
         }
