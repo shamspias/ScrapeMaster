@@ -21,14 +21,28 @@ import random
 import re
 import time
 import asyncio
+import os
+from dotenv import load_dotenv
 from urllib.parse import urljoin
 from difflib import SequenceMatcher
 
 import aiohttp
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from urllib.parse import urlparse
 
 from app.cache_manager import Cache
+
+load_dotenv()
+PROXY = os.getenv("PROXIES")
+
+parsed = urlparse(PROXY)
+proxy_settings = {
+    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+}
+if parsed.username and parsed.password:
+    proxy_settings["username"] = parsed.username
+    proxy_settings["password"] = parsed.password
 
 
 def compute_similarity(text1: str, text2: str) -> float:
@@ -75,12 +89,12 @@ class WebScraper:
     async def get_html_using_playwright(self, url: str) -> str:
         """
         Asynchronously retrieve rendered HTML using Playwright in headless mode.
-        Uses "networkidle" waiting and a brief sleep to allow full rendering.
+        First tries without a proxy, then retries using a proxy if the first attempt fails.
         """
         try:
+            # First attempt: no proxy
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                # Create a browser context with a random user agent.
                 context = await browser.new_context(user_agent=random.choice(self.USER_AGENTS))
                 page = await context.new_page()
                 await page.goto(url, wait_until="networkidle", timeout=15000)
@@ -89,8 +103,24 @@ class WebScraper:
                 await browser.close()
                 return html
         except Exception as e:
-            print(f"Playwright error for {url}: {e}")
-            return ""
+            print(f"Playwright no-proxy error for {url}: {e}")
+
+        # Retry using proxy if first attempt fails
+        if PROXY:
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True, proxy=proxy_settings)
+                    context = await browser.new_context(user_agent=random.choice(self.USER_AGENTS))
+                    page = await context.new_page()
+                    await page.goto(url, wait_until="networkidle", timeout=15000)
+                    await asyncio.sleep(1)
+                    html = await page.content()
+                    await browser.close()
+                    return html
+            except Exception as e:
+                print(f"Playwright with-proxy error for {url}: {e}")
+
+        return ""
 
     async def get_html_using_splash(self, url: str) -> str:
         """
